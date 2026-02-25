@@ -1,3 +1,20 @@
+//! # Intra-Ledger-Block Operation Ordering and Race Tests
+//!
+//! These tests simulate sequences of operations within a single ledger context.
+//! In Soroban, consistent results must be maintained regardless of call ordering
+//! where intended (e.g. net effect of deposits and withdrawals).
+//!
+//! ## Ordering Assumptions
+//! 1. **Balance Invariance**: The final balance should be the same regardless of order,
+//!    provided no intermediate state violates protocol rules (e.g. withdrawing more than available).
+//! 2. **Zero Interest within Ledger**: Since the ledger timestamp is constant within a block,
+//!    operations like borrow/repay do not accrue interest intra-ledger.
+//! 3. **Auth Requirements**: Each operation still requires proper authorization.
+//!
+//! ## Security Guarantees
+//! - Atomic state updates ensure no partial executions.
+//! - Protocol invariants (like collateral ratios) are checked at each step.
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
