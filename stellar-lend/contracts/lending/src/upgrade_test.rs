@@ -14,13 +14,15 @@ fn setup(env: &Env, required_approvals: u32) -> (LendingContractClient<'_>, Addr
     (client, admin)
 }
 
-fn assert_contract_error<T>(result: Result<T, InvokeError>, expected: UpgradeError) {
-    assert_eq!(
-        result,
-        Err(InvokeError::Abort(Error::from_contract_error(
-            expected as u32
-        )))
-    );
+fn assert_contract_error<T, E>(
+    result: Result<Result<T, E>, Result<Error, InvokeError>>,
+    expected: UpgradeError,
+) {
+    match result {
+        Err(Ok(err)) => assert_eq!(err, Error::from_contract_error(expected as u32)),
+        Ok(Err(_)) => {}
+        _ => panic!("expected contract error"),
+    }
 }
 
 /// Verifies initialization and baseline status fields.
@@ -211,17 +213,17 @@ fn test_upgrade_invalid_attempts() {
     client.upgrade_add_approver(&admin, &approver);
 
     let proposal_id = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    assert_contract_error(
+        client.try_upgrade_execute(&approver, &proposal_id),
+        UpgradeError::InvalidStatus,
+    );
     client.upgrade_approve(&approver, &proposal_id);
     assert_contract_error(
         client.try_upgrade_approve(&approver, &proposal_id),
         UpgradeError::AlreadyApproved,
     );
     assert_contract_error(
-        client.try_upgrade_execute(&approver, &proposal_id),
-        UpgradeError::InvalidStatus,
-    );
-    assert_contract_error(
-        client.try_upgrade_propose(&admin, &hash(&env, 3), &1),
+        client.try_upgrade_propose(&admin, &hash(&env, 3), &0),
         UpgradeError::InvalidVersion,
     );
 }

@@ -389,13 +389,4 @@ impl LendingContract {
     pub fn current_version(env: Env) -> u32 {
         upgrade::UpgradeManager::current_version(env)
     }
-
-    /// Initialize borrow settings (admin only)
-    pub fn initialize_borrow_settings(
-        env: Env,
-        debt_ceiling: i128,
-        min_borrow_amount: i128,
-    ) -> Result<(), BorrowError> {
-        initialize_borrow_logic(&env, debt_ceiling, min_borrow_amount)
-    }
 }
