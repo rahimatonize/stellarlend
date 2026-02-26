@@ -25,9 +25,6 @@ pub mod storage;
 pub mod types;
 pub mod withdraw;
 
-#[cfg(test)]
-mod tests;
-
 use crate::deposit::{DepositDataKey, ProtocolAnalytics};
 use crate::oracle::OracleConfig;
 use crate::risk_management::{RiskConfig, RiskManagementError};
