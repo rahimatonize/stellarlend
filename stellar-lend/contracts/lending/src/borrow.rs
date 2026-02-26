@@ -10,7 +10,7 @@
 //! ## Collateral Requirements
 //! Minimum collateral ratio is 150% (15,000 basis points).
 
-use crate::pause::{self, PauseType};
+use crate::pause::{self, blocks_high_risk_ops, is_recovery, PauseType};
 use soroban_sdk::{contracterror, contractevent, contracttype, Address, Env, I256};
 
 /// Errors that can occur during borrow operations.
@@ -132,7 +132,7 @@ pub fn borrow(
 ) -> Result<(), BorrowError> {
     user.require_auth();
 
-    if pause::is_paused(env, PauseType::Borrow) {
+    if pause::is_paused(env, PauseType::Borrow) || blocks_high_risk_ops(env) {
         return Err(BorrowError::ProtocolPaused);
     }
 
@@ -195,6 +195,10 @@ pub fn borrow(
 /// * `asset` - The collateral asset
 /// * `amount` - The amount to deposit
 pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(), BorrowError> {
+    if pause::is_paused(env, PauseType::Deposit) || blocks_high_risk_ops(env) {
+        return Err(BorrowError::ProtocolPaused);
+    }
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }
@@ -234,6 +238,10 @@ pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result
 /// * `asset` - The borrowed asset
 /// * `amount` - The amount to repay
 pub fn repay(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(), BorrowError> {
+    if pause::is_paused(env, PauseType::Repay) || (!is_recovery(env) && blocks_high_risk_ops(env)) {
+        return Err(BorrowError::ProtocolPaused);
+    }
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }

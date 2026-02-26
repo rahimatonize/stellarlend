@@ -24,7 +24,13 @@ use flash_loan::{
     flash_loan as flash_loan_impl, set_flash_loan_fee_bps as set_flash_loan_fee_impl,
     FlashLoanError,
 };
-use pause::{is_paused, set_pause as set_pause_impl, PauseType};
+use pause::{
+    blocks_high_risk_ops, complete_recovery as complete_recovery_logic,
+    get_emergency_state as get_emergency_state_logic, get_guardian as get_guardian_logic,
+    is_paused, is_recovery, set_guardian as set_guardian_logic, set_pause as set_pause_impl,
+    start_recovery as start_recovery_logic, trigger_shutdown as trigger_shutdown_logic,
+    EmergencyState, PauseType,
+};
 use token_receiver::receive as receive_impl;
 
 mod views;
@@ -44,6 +50,8 @@ pub use stellarlend_common::upgrade::{UpgradeError, UpgradeStage, UpgradeStatus}
 mod borrow_test;
 #[cfg(test)]
 mod deposit_test;
+#[cfg(test)]
+mod emergency_shutdown_test;
 #[cfg(test)]
 mod flash_loan_test;
 #[cfg(test)]
@@ -93,6 +101,9 @@ impl LendingContract {
         collateral_asset: Address,
         collateral_amount: i128,
     ) -> Result<(), BorrowError> {
+        if blocks_high_risk_ops(&env) {
+            return Err(BorrowError::ProtocolPaused);
+        }
         borrow_impl(
             &env,
             user,
@@ -110,19 +121,57 @@ impl LendingContract {
         pause_type: PauseType,
         paused: bool,
     ) -> Result<(), BorrowError> {
-        let current_admin = get_protocol_admin(&env).ok_or(BorrowError::Unauthorized)?;
-        if admin != current_admin {
-            return Err(BorrowError::Unauthorized);
-        }
-        admin.require_auth();
+        ensure_admin(&env, &admin)?;
         set_pause_impl(&env, admin, pause_type, paused);
         Ok(())
+    }
+
+    /// Configure guardian address authorized to trigger emergency shutdown.
+    pub fn set_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), BorrowError> {
+        ensure_admin(&env, &admin)?;
+        set_guardian_logic(&env, admin, guardian);
+        Ok(())
+    }
+
+    /// Return current guardian address if configured.
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        get_guardian_logic(&env)
+    }
+
+    /// Trigger emergency shutdown (admin or guardian).
+    pub fn emergency_shutdown(env: Env, caller: Address) -> Result<(), BorrowError> {
+        ensure_shutdown_authorized(&env, &caller)?;
+        caller.require_auth();
+        trigger_shutdown_logic(&env, caller);
+        Ok(())
+    }
+
+    /// Move from hard shutdown into controlled user recovery.
+    pub fn start_recovery(env: Env, admin: Address) -> Result<(), BorrowError> {
+        ensure_admin(&env, &admin)?;
+        if get_emergency_state_logic(&env) != EmergencyState::Shutdown {
+            return Err(BorrowError::ProtocolPaused);
+        }
+        start_recovery_logic(&env, admin);
+        Ok(())
+    }
+
+    /// Return protocol to normal operation after recovery procedures.
+    pub fn complete_recovery(env: Env, admin: Address) -> Result<(), BorrowError> {
+        ensure_admin(&env, &admin)?;
+        complete_recovery_logic(&env, admin);
+        Ok(())
+    }
+
+    /// Read current emergency lifecycle state.
+    pub fn get_emergency_state(env: Env) -> EmergencyState {
+        get_emergency_state_logic(&env)
     }
 
     /// Repay borrowed assets
     pub fn repay(env: Env, user: Address, asset: Address, amount: i128) -> Result<(), BorrowError> {
         user.require_auth();
-        if is_paused(&env, PauseType::Repay) {
+        if is_paused(&env, PauseType::Repay) || (!is_recovery(&env) && blocks_high_risk_ops(&env)) {
             return Err(BorrowError::ProtocolPaused);
         }
         borrow_repay(&env, user, asset, amount)
@@ -136,7 +185,7 @@ impl LendingContract {
         amount: i128,
     ) -> Result<(), BorrowError> {
         user.require_auth();
-        if is_paused(&env, PauseType::Deposit) {
+        if is_paused(&env, PauseType::Deposit) || blocks_high_risk_ops(&env) {
             return Err(BorrowError::ProtocolPaused);
         }
         borrow_deposit(&env, user, asset, amount)
@@ -149,7 +198,7 @@ impl LendingContract {
         asset: Address,
         amount: i128,
     ) -> Result<i128, DepositError> {
-        if is_paused(&env, PauseType::Deposit) {
+        if is_paused(&env, PauseType::Deposit) || blocks_high_risk_ops(&env) {
             return Err(DepositError::DepositPaused);
         }
         deposit_impl(&env, user, asset, amount)
@@ -165,7 +214,7 @@ impl LendingContract {
         _amount: i128,
     ) -> Result<(), BorrowError> {
         liquidator.require_auth();
-        if is_paused(&env, PauseType::Liquidation) {
+        if is_paused(&env, PauseType::Liquidation) || blocks_high_risk_ops(&env) {
             return Err(BorrowError::ProtocolPaused);
         }
         // Stub implementation, or call borrow::liquidate if it exists
@@ -284,6 +333,9 @@ impl LendingContract {
         amount: i128,
         params: Bytes,
     ) -> Result<(), FlashLoanError> {
+        if is_paused(&env, PauseType::All) || blocks_high_risk_ops(&env) {
+            return Err(FlashLoanError::ProtocolPaused);
+        }
         flash_loan_impl(&env, receiver, asset, amount, params)
     }
 
@@ -300,9 +352,11 @@ impl LendingContract {
         user: Address,
         asset: Address,
         amount: i128,
-    ) -> Result<i128, withdraw::WithdrawError> {
-        if is_paused(&env, PauseType::Withdraw) {
-            return Err(withdraw::WithdrawError::WithdrawPaused);
+    ) -> Result<i128, WithdrawError> {
+        if is_paused(&env, PauseType::Withdraw)
+            || (!is_recovery(&env) && blocks_high_risk_ops(&env))
+        {
+            return Err(WithdrawError::WithdrawPaused);
         }
         withdraw_logic(&env, user, asset, amount)
     }
@@ -311,18 +365,17 @@ impl LendingContract {
     pub fn initialize_withdraw_settings(
         env: Env,
         min_withdraw_amount: i128,
-    ) -> Result<(), withdraw::WithdrawError> {
-        let current_admin =
-            get_protocol_admin(&env).ok_or(withdraw::WithdrawError::Unauthorized)?;
+    ) -> Result<(), WithdrawError> {
+        let current_admin = get_protocol_admin(&env).ok_or(WithdrawError::Unauthorized)?;
         current_admin.require_auth();
-        withdraw::initialize_withdraw_settings(&env, min_withdraw_amount)
+        initialize_withdraw_logic(&env, min_withdraw_amount)
     }
 
     /// Set withdraw pause state (admin only)
-    pub fn set_withdraw_paused(env: Env, paused: bool) -> Result<(), withdraw::WithdrawError> {
-        let admin = get_protocol_admin(&env).ok_or(withdraw::WithdrawError::Unauthorized)?;
+    pub fn set_withdraw_paused(env: Env, paused: bool) -> Result<(), WithdrawError> {
+        let admin = get_protocol_admin(&env).ok_or(WithdrawError::Unauthorized)?;
         admin.require_auth();
-        withdraw::set_withdraw_paused(&env, paused)
+        set_withdraw_paused_logic(&env, paused)
     }
 
     /// Token receiver hook
@@ -385,4 +438,27 @@ impl LendingContract {
     pub fn current_version(env: Env) -> u32 {
         upgrade::UpgradeManager::current_version(env)
     }
+}
+
+fn ensure_admin(env: &Env, admin: &Address) -> Result<(), BorrowError> {
+    let current_admin = get_protocol_admin(env).ok_or(BorrowError::Unauthorized)?;
+    if *admin != current_admin {
+        return Err(BorrowError::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+fn ensure_shutdown_authorized(env: &Env, caller: &Address) -> Result<(), BorrowError> {
+    let admin = get_protocol_admin(env).ok_or(BorrowError::Unauthorized)?;
+    if *caller == admin {
+        return Ok(());
+    }
+
+    let guardian = get_guardian_logic(env).ok_or(BorrowError::Unauthorized)?;
+    if *caller != guardian {
+        return Err(BorrowError::Unauthorized);
+    }
+
+    Ok(())
 }
