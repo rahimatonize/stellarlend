@@ -1637,9 +1637,6 @@ impl HelloContract {
 }
 
 #[cfg(test)]
-mod test;
-
-#[cfg(test)]
 mod test_reentrancy;
 
 #[cfg(test)]
