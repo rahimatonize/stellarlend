@@ -4,9 +4,13 @@
       "Bash(cargo build:*)",
       "Bash(rustup target:*)",
       "Bash(cargo test:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(echo \"EXIT:$?\")"
     ],
     "deny": [],
     "ask": []
-  }
+  },
+  "disabledMcpjsonServers": [
+    "supabase"
+  ]
 }
