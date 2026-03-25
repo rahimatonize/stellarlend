@@ -249,8 +249,10 @@ async function main(): Promise<void> {
   }
 }
 
-// Run if this is the main module
-main().catch(console.error);
+// Run if this is the main module and not in a test environment
+if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+  main().catch(console.error);
+}
 
 // Export for programmatic use
 export { loadConfig, maskSecret, getSafeConfig } from './config.js';
