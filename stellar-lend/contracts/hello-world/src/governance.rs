@@ -9,14 +9,20 @@ pub use crate::types::{
     GovernanceConfig, MultisigConfig, Proposal, ProposalOutcome, ProposalStatus, ProposalType,
     RecoveryRequest, VoteInfo, VoteType, BASIS_POINTS_SCALE, DEFAULT_EXECUTION_DELAY,
     DEFAULT_QUORUM_BPS, DEFAULT_RECOVERY_PERIOD, DEFAULT_TIMELOCK_DURATION, DEFAULT_VOTING_PERIOD,
-    DEFAULT_VOTING_THRESHOLD,
+    DEFAULT_VOTING_THRESHOLD, MIN_TIMELOCK_DELAY,
 };
 
 use crate::events::{
     GovernanceInitializedEvent, GuardianAddedEvent, GuardianRemovedEvent, ProposalApprovedEvent,
-    ProposalCancelledEvent,     ProposalQueuedEvent, RecoveryApprovedEvent, RecoveryExecutedEvent, RecoveryStartedEvent,
-    VoteCastEvent, emit_proposal_approved,
+    ProposalCancelledEvent, ProposalCreatedEvent, ProposalExecutedEvent, ProposalFailedEvent,
+    ProposalQueuedEvent, RecoveryApprovedEvent, RecoveryExecutedEvent, RecoveryStartedEvent,
+    VoteCastEvent,
 };
+
+use crate::{interest_rate, risk_management, risk_params};
+
+/// Maximum byte length for a proposal description string.
+pub const MAX_DESCRIPTION_LEN: u32 = 256;
 
 // ========================================================================
 // Initialization
@@ -96,7 +102,6 @@ pub fn initialize(
     Ok(())
 }
 
-
 // ========================================================================
 // Proposal Creation
 // ========================================================================
@@ -109,6 +114,10 @@ pub fn create_proposal(
     voting_threshold: Option<i128>,
 ) -> Result<u64, GovernanceError> {
     proposer.require_auth();
+
+    if description.len() > MAX_DESCRIPTION_LEN {
+        return Err(GovernanceError::InputTooLong);
+    }
 
     let config: GovernanceConfig = env
         .storage()
@@ -474,6 +483,10 @@ pub fn create_admin_proposal(
 ) -> Result<u64, GovernanceError> {
     admin.require_auth();
 
+    if description.len() > MAX_DESCRIPTION_LEN {
+        return Err(GovernanceError::InputTooLong);
+    }
+
     let stored_admin: Address = env
         .storage()
         .instance()
@@ -525,7 +538,7 @@ pub fn create_admin_proposal(
         .set(&GovernanceDataKey::NextProposalId, &(proposal_id + 1));
 
     emit_proposal_created_event(env, &proposal_id, &admin);
-    
+
     let topics = (Symbol::new(env, "proposal_queued"), proposal_id);
     env.events().publish(topics, execution_time);
 
@@ -540,11 +553,15 @@ pub fn create_emergency_proposal(
 ) -> Result<u64, GovernanceError> {
     caller.require_auth();
 
+    if description.len() > MAX_DESCRIPTION_LEN {
+        return Err(GovernanceError::InputTooLong);
+    }
+
     // Verification of multisig auth happens via approvals in multisig module,
     // but for "emergency bypass" we can allow direct execution if called by a valid multisig admin
     // assuming it's correctly authorized by the multisig threshold.
     // In this simplified version, we'll check against multisig admins.
-    
+
     let multisig_config: MultisigConfig = env
         .storage()
         .instance()
@@ -825,6 +842,7 @@ fn emit_proposal_created_event(env: &Env, proposal_id: &u64, proposer: &Address)
     env.events().publish(topics, ());
 }
 
+#[allow(dead_code)]
 fn emit_vote_cast_event(
     env: &Env,
     proposal_id: &u64,
@@ -845,12 +863,11 @@ pub fn emit_proposal_executed_event(env: &Env, proposal_id: &u64, executor: &Add
     env.events().publish(topics, ());
 }
 
+#[allow(dead_code)]
 fn emit_proposal_failed_event(env: &Env, proposal_id: &u64) {
     let topics = (Symbol::new(env, "proposal_failed"), *proposal_id);
     env.events().publish(topics, ());
 }
-
-
 
 pub fn add_guardian(env: &Env, caller: Address, guardian: Address) -> Result<(), GovernanceError> {
     caller.require_auth();

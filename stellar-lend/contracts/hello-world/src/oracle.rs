@@ -16,9 +16,9 @@
 //! - Only the admin or the designated oracle address may submit price updates.
 
 #![allow(unused)]
+use crate::admin::get_admin;
 use crate::deposit::DepositDataKey;
 use crate::events::{emit_price_updated, PriceUpdatedEvent};
-use crate::risk_management::get_admin;
 use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 
 /// Errors that can occur during oracle operations
@@ -69,8 +69,6 @@ pub enum OracleDataKey {
     OracleConfig,
     /// Pause switches specifically for oracle updates: Map<Symbol, bool>
     PauseSwitches,
-    PrimaryOracle(Address),
-    FallbackFeed(Address),
 }
 
 /// Price feed data structure

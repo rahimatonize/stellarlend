@@ -42,11 +42,39 @@ export class StellarService {
   async getAccount(address: string): Promise<Account> {
     try {
       const response = await axios.get(`${this.horizonUrl}/accounts/${address}`);
-      return new Account(response.data.id, response.data.sequence);
+      const data = response.data as { id: string; sequence: string };
+      return new Account(data.id, data.sequence);
     } catch (error) {
       logger.error('Failed to fetch account:', error);
       throw new InternalServerError('Failed to fetch account information');
     }
+  }
+
+  private async buildTransaction(
+    operation: LendingOperation,
+    userAddress: string,
+    assetAddress: string | undefined,
+    amount: string
+  ): Promise<string> {
+    const account = await this.getAccount(userAddress);
+    const contract = new Contract(this.contractId);
+
+    const params = [
+      new Address(userAddress).toScVal(),
+      assetAddress ? new Address(assetAddress).toScVal() : xdr.ScVal.scvVoid(),
+      nativeToScVal(BigInt(amount), { type: 'i128' }),
+    ];
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(contract.call(CONTRACT_METHODS[operation], ...params))
+      .setTimeout(TX_TIMEOUT_SECONDS)
+      .build();
+
+    const preparedTx = await this.sorobanServer.prepareTransaction(tx);
+    return preparedTx.toXDR();
   }
 
   async buildUnsignedTransaction(
@@ -56,25 +84,7 @@ export class StellarService {
     amount: string
   ): Promise<string> {
     try {
-      const account = await this.getAccount(userAddress);
-      const contract = new Contract(this.contractId);
-
-      const params = [
-        new Address(userAddress).toScVal(),
-        assetAddress ? new Address(assetAddress).toScVal() : xdr.ScVal.scvVoid(),
-        nativeToScVal(BigInt(amount), { type: 'i128' }),
-      ];
-
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(contract.call(CONTRACT_METHODS[operation], ...params))
-        .setTimeout(TX_TIMEOUT_SECONDS)
-        .build();
-
-      const preparedTx = await this.sorobanServer.prepareTransaction(tx);
-      return preparedTx.toXDR();
+      return await this.buildTransaction(operation, userAddress, assetAddress, amount);
     } catch (error) {
       logger.error(`Failed to build unsigned ${operation} transaction:`, error);
       throw new InternalServerError(`Failed to build ${operation} transaction`);
@@ -82,37 +92,118 @@ export class StellarService {
   }
 
   async submitTransaction(txXdr: string): Promise<TransactionResponse> {
-    try {
-      const response = await axios.post(`${this.horizonUrl}/transactions`, { tx: txXdr });
-      return {
-        success: true,
-        transactionHash: response.data.hash,
-        status: 'success',
-        ledger: response.data.ledger,
-      };
-    } catch (error: any) {
-      logger.error('Transaction submission failed:', error);
-      return {
-        success: false,
-        status: 'failed',
-        error: error.response?.data?.extras?.result_codes || error.message,
-      };
+    const {
+      request: { maxRetries, retryInitialDelayMs, retryMaxDelayMs, timeout },
+    } = config;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await axios.post(
+          `${this.horizonUrl}/transactions`,
+          { tx: txXdr },
+          { timeout }
+        );
+        // Horizon and other RPCs can return slightly different shapes; the only
+        // reliable indicator we validate here is `successful` when present.
+        const data = response.data as any;
+        const successful: unknown = data?.successful;
+        const transactionHash: string | undefined =
+          data?.hash ?? data?.transaction_hash ?? data?.transactionHash;
+        const ledger: number | undefined = data?.ledger ?? data?.ledger_index ?? data?.ledgerIndex;
+
+        if (successful === false) {
+          return {
+            success: false,
+            transactionHash,
+            status: 'failed',
+            error: 'Transaction failed on-chain',
+            message: 'Provider reported on-chain failure despite successful HTTP submission',
+            ledger,
+            details: data,
+          };
+        }
+
+        return {
+          success: true,
+          transactionHash,
+          status: 'success',
+          ledger,
+        };
+      } catch (error: any) {
+        const status = error?.response?.status as number | undefined;
+        const isClientError = typeof status === 'number' && status >= 400 && status < 500;
+        const isRetryable =
+          // Network error (no response) is retryable
+          !error?.response ||
+          // 5xx server errors are retryable
+          (typeof status === 'number' && status >= 500);
+
+        // Immediately fail on non-retryable 4xx errors
+        if (isClientError && status !== 429) {
+          logger.error('Transaction submission failed (non-retryable):', error);
+          return {
+            success: false,
+            status: 'failed',
+            error: error.response?.data?.extras?.result_codes || error.message,
+          };
+        }
+
+        // If we've exhausted retries or it's not retryable, return failure
+        if (attempt === maxRetries || !isRetryable) {
+          logger.error('Transaction submission failed (final):', error);
+          return {
+            success: false,
+            status: 'failed',
+            error: error.response?.data?.extras?.result_codes || error.message,
+          };
+        }
+
+        // Exponential backoff with cap
+        const backoff = Math.min(retryInitialDelayMs * Math.pow(2, attempt), retryMaxDelayMs);
+        logger.warn(
+          `Submit transaction attempt ${attempt + 1} failed${
+            status ? ` (status ${status})` : ''
+          }. Retrying in ${backoff} ms...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+      }
     }
+
+    // Fallback — should be unreachable because loop returns
+    return {
+      success: false,
+      status: 'failed',
+      error: 'Unknown submission error',
+    };
   }
 
-  async monitorTransaction(txHash: string, timeoutMs = 30000): Promise<TransactionResponse> {
+  async monitorTransaction(
+    txHash: string,
+    timeoutMs = 30000,
+    abortSignal?: AbortSignal
+  ): Promise<TransactionResponse> {
     const startTime = Date.now();
-    const pollInterval = 1000;
+    let delay = 500;
+    const maxDelay = 5000;
 
     while (Date.now() - startTime < timeoutMs) {
+      if (abortSignal?.aborted) {
+        return {
+          success: false,
+          transactionHash: txHash,
+          status: 'cancelled',
+          message: 'Transaction monitoring cancelled',
+        };
+      }
       try {
         const response = await axios.get(`${this.horizonUrl}/transactions/${txHash}`);
-        if (response.data.successful) {
+        const data = response.data as { successful: boolean; ledger: number };
+        if (data.successful) {
           return {
             success: true,
             transactionHash: txHash,
             status: 'success',
-            ledger: response.data.ledger,
+            ledger: data.ledger,
           };
         }
         return {
@@ -123,7 +214,29 @@ export class StellarService {
         };
       } catch (error: any) {
         if (error.response?.status === 404) {
-          await new Promise((resolve) => setTimeout(resolve, pollInterval));
+          // Wait for delay or until aborted
+          await new Promise((resolve) => {
+            const timeout = setTimeout(resolve, delay);
+            if (abortSignal) {
+              abortSignal.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(timeout);
+                  resolve(undefined);
+                },
+                { once: true }
+              );
+            }
+          });
+          if (abortSignal?.aborted) {
+            return {
+              success: false,
+              transactionHash: txHash,
+              status: 'cancelled',
+              message: 'Transaction monitoring cancelled',
+            };
+          }
+          delay = Math.min(delay * 2, maxDelay);
           continue;
         }
         logger.error('Error monitoring transaction:', error);

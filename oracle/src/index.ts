@@ -7,7 +7,7 @@
  */
 
 import { loadConfig, getSafeConfig, type OracleServiceConfig } from './config.js';
-import { configureLogger, logger } from './utils/logger.js';
+import { configureLogger, logger, logProviderHealth, logStalenessAlert } from './utils/logger.js';
 import {
   createCoinGeckoProvider,
   createBinanceProvider,
@@ -37,6 +37,7 @@ export class OracleService {
   private contractUpdater: ContractUpdater;
   private intervalId?: ReturnType<typeof setInterval>;
   private isRunning: boolean = false;
+  private lastSuccessfulUpdate: number | null = null;
 
   constructor(config: OracleServiceConfig) {
     // Store config but never log adminSecretKey directly
@@ -61,7 +62,9 @@ export class OracleService {
 
     const cache = createPriceCache(config.cacheTtlSeconds);
 
-    this.aggregator = createAggregator(providers, validator, cache);
+    this.aggregator = createAggregator(providers, validator, cache, {
+      circuitBreaker: config.circuitBreaker,
+    });
 
     this.contractUpdater = createContractUpdater({
       network: config.stellarNetwork,
@@ -131,6 +134,16 @@ export class OracleService {
 
     logger.info('Starting price update cycle', { assets });
 
+    // Check for staleness
+    if (this.lastSuccessfulUpdate) {
+      const ageSeconds = (Date.now() - this.lastSuccessfulUpdate) / 1000;
+      const thresholdSeconds = this.config.priceStaleThresholdSeconds;
+
+      if (ageSeconds > thresholdSeconds) {
+        logStalenessAlert(ageSeconds, thresholdSeconds, this.lastSuccessfulUpdate);
+      }
+    }
+
     try {
       // Fetch aggregated prices
       const prices = await this.aggregator.getPrices(assets);
@@ -158,6 +171,10 @@ export class OracleService {
         durationMs: Date.now() - startTime,
       });
 
+      if (successful.length > 0) {
+        this.lastSuccessfulUpdate = Date.now();
+      }
+
       if (failed.length > 0) {
         logger.warn('Some price updates failed', {
           failedAssets: failed.map((f) => f.asset),
@@ -180,6 +197,7 @@ export class OracleService {
       adminSecretKey: safe.adminSecretKey, // masked value
       providers: this.aggregator.getProviders(),
       aggregatorStats: this.aggregator.getStats(),
+      circuitBreakers: this.aggregator.getCircuitBreakerMetrics(),
     };
   }
 

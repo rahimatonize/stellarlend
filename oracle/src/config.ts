@@ -33,6 +33,8 @@ const envSchema = z.object({
   UPDATE_INTERVAL_MS: z.coerce.number().positive().default(60000),
   MAX_PRICE_DEVIATION_PERCENT: z.coerce.number().positive().default(10),
   PRICE_STALENESS_THRESHOLD_SECONDS: z.coerce.number().positive().default(300),
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(3),
+  CIRCUIT_BREAKER_BACKOFF_MS: z.coerce.number().positive().default(30_000),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 });
 
@@ -166,6 +168,10 @@ export function loadConfig(): OracleServiceConfig {
     redisUrl: env.REDIS_URL,
     logLevel: env.LOG_LEVEL,
     providers: getProviderConfigs(env),
+    circuitBreaker: {
+      failureThreshold: env.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+      backoffMs: env.CIRCUIT_BREAKER_BACKOFF_MS,
+    },
   };
 }
 
@@ -184,7 +190,9 @@ export function maskSecret(key: string): string {
  * Returns a safe (redacted) version of the config for logging.
  * Strips adminSecretKey entirely.
  */
-export function getSafeConfig(config: OracleServiceConfig): Omit<OracleServiceConfig, 'adminSecretKey'> & { adminSecretKey: string } {
+export function getSafeConfig(
+  config: OracleServiceConfig
+): Omit<OracleServiceConfig, 'adminSecretKey'> & { adminSecretKey: string } {
   return {
     ...config,
     adminSecretKey: maskSecret(config.adminSecretKey),

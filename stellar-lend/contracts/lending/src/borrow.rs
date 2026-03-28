@@ -134,8 +134,8 @@ pub fn borrow(
         return Err(BorrowError::DebtCeilingReached);
     }
 
-    let mut debt_position = get_debt_position(env, &user);
-    let accrued_interest = calculate_interest(env, &debt_position);
+    let mut debt_position = get_debt_position(env, &user, Some(&asset));
+    let accrued_interest = calculate_interest(env, &debt_position)?;
 
     debt_position.borrowed_amount = debt_position
         .borrowed_amount
@@ -215,7 +215,7 @@ pub fn repay(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(
         return Err(BorrowError::InvalidAmount);
     }
 
-    let mut debt_position = get_debt_position(env, &user);
+    let mut debt_position = get_debt_position(env, &user, Some(&asset));
 
     if debt_position.borrowed_amount == 0 && debt_position.interest_accrued == 0 {
         return Err(BorrowError::InvalidAmount);
@@ -226,7 +226,7 @@ pub fn repay(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(
     }
 
     // First repay interest, then principal
-    let accrued_interest = calculate_interest(env, &debt_position);
+    let accrued_interest = calculate_interest(env, &debt_position)?;
     debt_position.interest_accrued = debt_position
         .interest_accrued
         .checked_add(accrued_interest)
@@ -253,7 +253,9 @@ pub fn repay(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(
 
         // Update total protocol debt
         let total_debt = get_total_debt(env);
-        let new_total = total_debt.saturating_sub(remaining_repayment);
+        let new_total = total_debt
+            .checked_sub(remaining_repayment)
+            .ok_or(BorrowError::Overflow)?;
         set_total_debt(env, new_total);
     }
 
@@ -285,9 +287,9 @@ pub(crate) fn validate_collateral_ratio(collateral: i128, borrow: i128) -> Resul
     Ok(())
 }
 
-pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> i128 {
+pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> Result<i128, BorrowError> {
     if position.borrowed_amount == 0 {
-        return 0;
+        return Ok(0);
     }
 
     let current_time = env.ledger().timestamp();
@@ -303,10 +305,10 @@ pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> i128 {
         .div(&I256::from_i128(env, 10000))
         .div(&I256::from_i128(env, SECONDS_PER_YEAR as i128));
 
-    interest_256.to_i128().unwrap_or(i128::MAX)
+    interest_256.to_i128().ok_or(BorrowError::Overflow)
 }
 
-fn get_debt_position(env: &Env, user: &Address) -> DebtPosition {
+fn get_debt_position(env: &Env, user: &Address, default_asset: Option<&Address>) -> DebtPosition {
     env.storage()
         .persistent()
         .get(&BorrowDataKey::BorrowUserDebt(user.clone()))
@@ -314,7 +316,7 @@ fn get_debt_position(env: &Env, user: &Address) -> DebtPosition {
             borrowed_amount: 0,
             interest_accrued: 0,
             last_update: env.ledger().timestamp(),
-            asset: user.clone(),
+            asset: default_asset.cloned().unwrap_or_else(|| user.clone()),
         })
 }
 
@@ -394,9 +396,10 @@ pub fn initialize_borrow_settings(
 }
 
 pub fn get_user_debt(env: &Env, user: &Address) -> DebtPosition {
-    let mut position = get_debt_position(env, user);
-    let accrued = calculate_interest(env, &position);
-    position.interest_accrued = position.interest_accrued.saturating_add(accrued);
+    let mut position = get_debt_position(env, user, None);
+    if let Ok(accrued) = calculate_interest(env, &position) {
+        position.interest_accrued = position.interest_accrued.saturating_add(accrued);
+    }
     position
 }
 
