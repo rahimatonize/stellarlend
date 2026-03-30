@@ -76,6 +76,14 @@ export interface HealthCheckResponse {
   };
 }
 
+export interface ProtocolStatsResponse {
+  totalDeposits: string;
+  totalBorrows: string;
+  utilizationRate: string;
+  numberOfUsers: number;
+  tvl: string;
+}
+
 export enum TransactionStatus {
   PENDING = 'pending',
   SUCCESS = 'success',
@@ -114,3 +122,31 @@ export type ServerMessage =
   | { type: 'unsubscribed'; assets: string[] }
   | { type: 'pong' }
   | { type: 'error'; message: string };
+
+// ─── Transaction History Types ──────────────────────────────────────────────────
+
+export interface TransactionHistoryItem {
+  transactionHash: string;
+  type: LendingOperation;
+  amount: string;
+  assetAddress?: string;
+  timestamp: string;
+  status: 'success' | 'failed' | 'pending';
+  ledger?: number;
+  memo?: string;
+}
+
+export interface TransactionHistoryResponse {
+  transactions: TransactionHistoryItem[];
+  pagination: {
+    cursor?: string;
+    hasNextPage: boolean;
+    limit: number;
+  };
+}
+
+export interface TransactionHistoryQuery {
+  userAddress: string;
+  limit?: number;
+  cursor?: string;
+}

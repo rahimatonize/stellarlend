@@ -21,6 +21,7 @@ afterEach(() => {
 
 // Mock StellarService before importing app
 import { StellarService } from '../services/stellar.service';
+import { idempotencyStore } from '../middleware/idempotency';
 jest.mock('../services/stellar.service');
 const mockStellarService: jest.Mocked<StellarService> = {
   buildUnsignedTransaction: jest.fn().mockResolvedValue('unsigned_xdr_string'),
@@ -35,9 +36,33 @@ const mockStellarService: jest.Mocked<StellarService> = {
     status: 'success',
     ledger: 12345,
   }),
+  getProtocolStats: jest.fn().mockResolvedValue({
+    totalDeposits: '1000000',
+    totalBorrows: '500000',
+    utilizationRate: '0.50',
+    numberOfUsers: 150,
+    tvl: '1500000',
+  }),
   healthCheck: jest.fn().mockResolvedValue({
     horizon: true,
     sorobanRpc: true,
+  }),
+  getTransactionHistory: jest.fn().mockResolvedValue({
+    transactions: [
+      {
+        transactionHash: 'tx_hash_1',
+        type: 'deposit',
+        amount: '1000000',
+        assetAddress: 'GTEST123...',
+        timestamp: '2023-01-01T00:00:00Z',
+        status: 'success',
+        ledger: 12345,
+      },
+    ],
+    pagination: {
+      hasNextPage: false,
+      limit: 10,
+    },
   }),
 } as any;
 (StellarService as jest.Mock).mockImplementation(() => mockStellarService);
@@ -48,11 +73,13 @@ jest.mock('../utils/logger');
 const mockLogger = logger as jest.Mocked<typeof logger>;
 
 import request from 'supertest';
-import app from '../app';
+import app, { resetRateLimiters } from '../app';
 
 describe('Lending Controller', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
+    idempotencyStore.clear();
+    await resetRateLimiters();
   });
 
   describe('GET /api/lending/prepare/:operation', () => {
@@ -227,9 +254,11 @@ describe('Lending Controller', () => {
       expect(response.status).toBe(200);
       
       // Verify audit log does not contain any secret fields
-      const auditCall = mockLogger.info.mock.calls.find(call => call[0] === 'AUDIT');
+      const auditCall = (mockLogger.info.mock.calls as Array<any[]>).find(
+        (call) => call[0] === 'AUDIT' && typeof call[1] === 'object' && call[1] !== null
+      );
       expect(auditCall).toBeDefined();
-      const auditData = auditCall![1];
+      const auditData = (auditCall?.[1] ?? {}) as Record<string, unknown>;
       
       // Ensure no secret fields are present
       expect(Object.keys(auditData)).not.toContain('userSecret');
@@ -249,13 +278,102 @@ describe('Lending Controller', () => {
     it('should return unhealthy status when services are down', async () => {
       mockStellarService.healthCheck.mockResolvedValueOnce({
         horizon: false,
-        sorobanRpc: false,
+        sorobanRpc: true,
       });
 
       const response = await request(app).get('/api/health');
 
       expect(response.status).toBe(503);
       expect(response.body.status).toBe('unhealthy');
+    });
+  });
+
+  describe('GET /api/health/live', () => {
+    it('should return ok without checking upstream dependencies', async () => {
+      const response = await request(app).get('/api/health/live');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ status: 'ok' });
+      expect(mockStellarService.healthCheck).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /api/health/ready', () => {
+    it('should return ok when all dependencies are up', async () => {
+      const response = await request(app).get('/api/health/ready');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        status: 'ok',
+        horizon: 'up',
+        soroban: 'up',
+      });
+    });
+
+    it('should return 503 when a dependency is unavailable', async () => {
+      mockStellarService.healthCheck.mockResolvedValueOnce({
+        horizon: false,
+        sorobanRpc: true,
+      });
+
+      const response = await request(app).get('/api/health/ready');
+
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({
+        status: 'error',
+        horizon: 'down',
+        soroban: 'up',
+      });
+    });
+  });
+
+  describe('GET /api/protocol/stats', () => {
+    it('should return protocol statistics', async () => {
+      const response = await request(app).get('/api/protocol/stats');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        totalDeposits: '1000000',
+        totalBorrows: '500000',
+        utilizationRate: '0.50',
+        numberOfUsers: 150,
+        tvl: '1500000',
+      });
+      expect(response.headers['cache-control']).toBe('public, max-age=30');
+    });
+  });
+
+  describe('Idempotency-Key', () => {
+    const idemKey = '123e4567-e89b-12d3-a456-426614174000';
+
+    it('should replay a cached submit response for duplicate POST requests', async () => {
+      const firstResponse = await request(app)
+        .post('/api/lending/submit')
+        .set('Idempotency-Key', idemKey)
+        .send({ signedXdr: 'signed_xdr_string' });
+
+      const secondResponse = await request(app)
+        .post('/api/lending/submit')
+        .set('Idempotency-Key', idemKey)
+        .send({ signedXdr: 'signed_xdr_string' });
+
+      expect(firstResponse.status).toBe(200);
+      expect(firstResponse.headers['idempotency-status']).toBe('created');
+      expect(secondResponse.status).toBe(200);
+      expect(secondResponse.headers['idempotency-status']).toBe('cached');
+      expect(secondResponse.body).toEqual(firstResponse.body);
+      expect(mockStellarService.submitTransaction).toHaveBeenCalledTimes(1);
+      expect(mockStellarService.monitorTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reject non-UUID idempotency keys', async () => {
+      const response = await request(app)
+        .post('/api/lending/submit')
+        .set('Idempotency-Key', 'not-a-uuid')
+        .send({ signedXdr: 'signed_xdr_string' });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/Idempotency-Key/i);
     });
   });
 });
