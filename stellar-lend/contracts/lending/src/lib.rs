@@ -41,7 +41,18 @@ use withdraw::{
     set_withdraw_paused as set_withdraw_paused_logic, withdraw as withdraw_logic, WithdrawError,
 };
 mod data_store;
+mod insurance;
 mod upgrade;
+
+use insurance::{
+    collect_premium as insurance_collect_premium, evaluate_claim as insurance_evaluate_claim,
+    fund_pool as insurance_fund_pool, get_analytics as insurance_get_analytics,
+    get_claim_by_id as insurance_get_claim, get_coverage_limit as insurance_get_coverage_limit,
+    get_premium_rate as insurance_get_premium_rate,
+    initialize as insurance_initialize,
+    set_coverage_limit as insurance_set_coverage_limit,
+    submit_claim as insurance_submit_claim, InsuranceAnalytics, InsuranceClaim, InsuranceError,
+};
 
 #[cfg(test)]
 mod borrow_test;
@@ -51,6 +62,8 @@ mod data_store_test;
 mod deposit_test;
 #[cfg(test)]
 mod flash_loan_test;
+#[cfg(test)]
+mod insurance_test;
 #[cfg(test)]
 mod math_safety_test;
 #[cfg(test)]
@@ -323,5 +336,80 @@ impl LendingContract {
         min_borrow_amount: i128,
     ) -> Result<(), BorrowError> {
         initialize_borrow_logic(&env, debt_ceiling, min_borrow_amount)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Insurance pool
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Initialize the insurance pool (admin only, call once).
+    pub fn insurance_initialize(env: Env, admin: Address) -> Result<(), InsuranceError> {
+        insurance_initialize(&env, &admin)
+    }
+
+    /// Contribute protocol fees to the insurance pool.
+    pub fn insurance_fund_pool(env: Env, amount: i128) -> Result<(), InsuranceError> {
+        insurance_fund_pool(&env, amount)
+    }
+
+    /// Collect a coverage premium from a user for a given asset.
+    /// Returns the premium amount charged.
+    pub fn insurance_collect_premium(
+        env: Env,
+        payer: Address,
+        asset: Address,
+        coverage_amount: i128,
+    ) -> Result<i128, InsuranceError> {
+        insurance_collect_premium(&env, payer, asset, coverage_amount)
+    }
+
+    /// Submit an insurance claim. Returns the new claim ID.
+    pub fn insurance_submit_claim(
+        env: Env,
+        claimant: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<u64, InsuranceError> {
+        insurance_submit_claim(&env, claimant, asset, amount)
+    }
+
+    /// Evaluate (approve or reject) a pending claim (admin only).
+    pub fn insurance_evaluate_claim(
+        env: Env,
+        admin: Address,
+        claim_id: u64,
+        approve: bool,
+    ) -> Result<(), InsuranceError> {
+        insurance_evaluate_claim(&env, admin, claim_id, approve)
+    }
+
+    /// Set per-asset coverage limit in basis points (admin only).
+    pub fn insurance_set_coverage_limit(
+        env: Env,
+        admin: Address,
+        asset: Address,
+        limit_bps: i128,
+    ) -> Result<(), InsuranceError> {
+        insurance_set_coverage_limit(&env, admin, asset, limit_bps)
+    }
+
+    /// Get a claim by ID.
+    pub fn insurance_get_claim(env: Env, claim_id: u64) -> Option<InsuranceClaim> {
+        insurance_get_claim(&env, claim_id)
+    }
+
+    /// Get current dynamic premium rate for an asset (basis points).
+    pub fn insurance_get_premium_rate(env: Env, asset: Address) -> i128 {
+        insurance_get_premium_rate(&env, &asset)
+    }
+
+    /// Get per-asset coverage limit in basis points.
+    pub fn insurance_get_coverage_limit(env: Env, asset: Address) -> i128 {
+        insurance_get_coverage_limit(&env, &asset)
+    }
+
+    /// Get insurance pool analytics.
+    pub fn insurance_get_analytics(env: Env) -> InsuranceAnalytics {
+        insurance_get_analytics(&env)
     }
 }
